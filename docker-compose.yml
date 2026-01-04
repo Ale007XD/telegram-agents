@@ -1,0 +1,9 @@
+services:
+  bot:
+    build: .
+    env_file: .env  # Docker подтянет ключи, созданные гитхабом в шаге 2
+    volumes:
+      - ./history.db:/app/history.db
+      - ./skills:/app/skills
+      - ./CLAUDE.md:/app/CLAUDE.md
+    restart: always
