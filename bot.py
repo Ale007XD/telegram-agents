@@ -114,5 +114,16 @@ async def main():
     print("🚀 Bot started")
     await dp.start_polling(bot)
 
+import signal
+import sys
+
+def signal_handler(sig, frame):
+    logging.info("Graceful shutdown...")
+    asyncio.create_task(bot.session.close())
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
 if __name__ == "__main__":
     asyncio.run(main())
