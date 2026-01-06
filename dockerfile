@@ -9,8 +9,8 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Копируем зависимости из builder
-COPY --from=builder /root/.local /root/.local
-ENV PATH=/root/.local/bin:$PATH
+COPY --from=builder /deploy/.local /deploy/.local
+ENV PATH=/deploy/.local/bin:$PATH
 
 # Копируем код
 COPY . .
