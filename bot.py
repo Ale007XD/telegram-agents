@@ -1,4 +1,9 @@
-import os, importlib, logging, sentry_sdk, asyncio
+import os
+import importlib
+import logging
+import sentry_sdk
+import asyncio
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types, BaseMiddleware
 from aiogram.filters import Command, BaseFilter
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -16,80 +21,97 @@ planner = Planner(os.getenv("OPENROUTER_API_KEY"))
 verifier = Verifier(os.getenv("OPENROUTER_API_KEY"))
 
 class AdminFilter(BaseFilter):
-    async def __call__(self, m: types.Message) -> bool:
-        return str(m.from_user.id) == os.getenv("ADMIN_ID")
+    async def __call__(self, message: types.Message) -> bool:
+        return str(message.from_user.id) == os.getenv("ADMIN_ID")
 
 class HistoryMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        if isinstance(event, types.Message) and event.text:
-            if not event.text.startswith('/'):
-                await save_message(event.from_user.id, "user", event.text)
+        if isinstance(event, types.Message) and event.text and not event.text.startswith('/'):
+            await save_message(event.from_user.id, "user", event.text)
         return await handler(event, data)
 
 dp.message.outer_middleware(HistoryMiddleware())
 
 def load_skills():
     dp.sub_routers.clear()
-    if not os.path.exists("skills"): os.makedirs("skills")
-    for f in os.listdir("skills"):
-        if f.endswith(".py") and not f.startswith("__"):
-            name = f"skills.{f[:-3]}"
-            mod = importlib.import_module(name)
-            importlib.reload(mod)
-            if hasattr(mod, "setup"): dp.include_router(mod.setup())
+    try:
+        import skills
+        for f in os.listdir("skills"):
+            if f.endswith(".py") and not f.startswith("__"):
+                module_name = f"skills.{f[:-3]}"
+                module = importlib.import_module(module_name)
+                importlib.reload(module)
+                if hasattr(module, "setup"):
+                    dp.include_router(module.setup())
+                    logging.info(f"Loaded skill: {module_name}")
+    except Exception as e:
+        logging.error(f"Skill load error: {e}")
 
 @dp.message(Command("start"))
-async def cmd_start(m: types.Message):
-    await m.answer("Бот активен. Доступные команды: /plan, /reload, /new_skill, /review")
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "🚀 Мультиагентный бот активен!\n\n"
+        "📋 /plan - Создать план задачи\n"
+        "✈️ /travel - Планировщик путешествий\n"
+        "🔄 /reload - Перезагрузка навыков (admin)\n"
+        "📝 /new_skill - Новый навык (admin)\n"
+        "🔍 /review - Анализ истории"
+    )
 
 @dp.message(Command("plan"))
-async def handle_plan(m: types.Message):
-    task = m.text.replace("/plan", "").strip()
-    if not task: return await m.answer("Напишите задачу после команды.")
+async def cmd_plan(message: types.Message):
+    task = message.text.replace("/plan", "").strip()
+    if not task:
+        return await message.answer("Напишите задачу после /plan")
     
-    history = await get_user_context(m.from_user.id)
+    history = await get_user_context(message.from_user.id)
     plan = await planner.process(task, history)
     verified = await verifier.process(plan)
     
-    reply = f"📋 **План:**
-{plan}
-
-✅ **Проверка:**
-{verified}"
-    await m.answer(reply, parse_mode="Markdown")
-    await save_message(m.from_user.id, "assistant", plan)
+    reply = f"📋 **План:**\n{plan}\n\n✅ **Проверка:**\n{verified}"
+    await message.answer(reply, parse_mode="Markdown")
+    await save_message(message.from_user.id, "assistant", plan)
 
 @dp.message(Command("new_skill"), AdminFilter())
-async def handle_new_skill(m: types.Message):
+async def cmd_new_skill(message: types.Message):
     try:
-        parts = m.text.split(maxsplit=2)
+        parts = message.text.split(maxsplit=2)
+        if len(parts) < 3:
+            return await message.answer("Формат: /new_skill имя_файла код_навыка")
+        
         name, code = parts[1], parts[2]
-        with open(f"skills/{name}.py", "w", encoding="utf-8") as f: f.write(code)
-        await m.answer(f"Навык {name} сохранен. Используйте /reload")
-    except: await m.answer("Формат: /new_skill название_файла код")
+        os.makedirs("skills", exist_ok=True)
+        
+        with open(f"skills/{name}.py", "w", encoding="utf-8") as f:
+            f.write(f'from aiogram import Router, types\nfrom aiogram.filters import Command\n\nrouter = Router()\n\n@router.message(Command("{name}"))\nasync def cmd_{name}(message: types.Message):\n    await message.answer("Навык {name} активирован!")\n\ndef setup():\n    return router\n')
+            f.write("\n" + code)
+        
+        await message.answer(f"✅ Навык `{name}` создан. Используйте /reload")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка создания: {e}")
 
 @dp.message(Command("reload"), AdminFilter())
-async def handle_reload(m: types.Message):
+async def cmd_reload(message: types.Message):
     load_skills()
-    await m.answer("🔄 Навыки перезагружены.")
+    await message.answer("🔄 Все навыки перезагружены!")
 
 @dp.message(Command("review"))
-async def handle_review(m: types.Message):
-    history = await get_user_context(m.from_user.id)
-    text_history = "
-".join([f"{i['role']}: {i['content']}" for i in history])
-    review = await verifier.process(f"Проанализируй контекст диалога на наличие нерешенных проблем: {text_history}")
+async def cmd_review(message: types.Message):
+    history = await get_user_context(message.from_user.id)
+    history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history])
+    
+    review = await verifier.process(f"Анализируй историю диалога: {history_text}")
     
     with open("CLAUDE.md", "a", encoding="utf-8") as f:
-        f.write(f"
-
-### Review {datetime.now()}
-{review}")
-    await m.answer("Анализ завершен и записан в CLAUDE.md")
+        f.write(f"\n\n## Review {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"User: {message.from_user.id}\n{review}\n")
+    
+    await message.answer("📊 Анализ завершен и записан в CLAUDE.md")
 
 async def main():
     await init_db()
     load_skills()
+    print("🚀 Bot started")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
