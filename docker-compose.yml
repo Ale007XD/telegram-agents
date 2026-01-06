@@ -1,9 +1,12 @@
+version: '3.8'
 services:
   bot:
     build: .
-    env_file: .env  # Docker подтянет ключи, созданные гитхабом в шаге 2
+    restart: always
+    env_file: .env
     volumes:
-      - ./history.db:/app/history.db
+      - ./history:/app/history
       - ./skills:/app/skills
       - ./CLAUDE.md:/app/CLAUDE.md
-    restart: always
+    ports:
+      - "8080:8080"
