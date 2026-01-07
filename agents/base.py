@@ -1,64 +1,82 @@
 import httpx
 import logging
-import json
+import asyncio
 
 class BaseAgent:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        # Базовый URL OpenRouter
         self.url = "https://openrouter.ai/api/v1/chat/completions"
+        # Список бесплатных моделей в порядке приоритета
+        self.fallback_chain = [
+            "meta-llama/llama-3.1-8b-instruct:free",   # Приоритет 1
+            "mistralai/mistral-7b-instruct:free",      # Приоритет 2
+            "microsoft/phi-3-medium-128k-instruct:free" # Приоритет 3 (последний шанс)
+        ]
 
-    async def _call(self, model: str, messages: list) -> str:
+    async def _call(self, model: str, messages: list, attempt: int = 0) -> str:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            # OpenRouter требует эти заголовки для рейтинга приложений
-            "HTTP-Referer": "https://github.com/YourUser/YourRepo", 
+            "HTTP-Referer": "https://github.com/skillsllm/bot",
             "X-Title": "SkillsLLM Bot"
         }
         
-        # Формируем тело запроса
         payload = {
             "model": model,
-            "messages": messages
+            "messages": messages,
+            "temperature": 0.7,
+            "max_tokens": 1000
         }
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=45.0) as client:
             try:
+                logging.info(f"Trying model: {model}...")
                 response = await client.post(self.url, json=payload, headers=headers)
                 
-                # Если ошибка 4xx или 5xx, выбрасываем исключение, чтобы попасть в except
-                response.raise_for_status()
+                # Специальная обработка для 429 (Too Many Requests) и 5xx
+                if response.status_code in [429, 500, 502, 503, 504]:
+                    raise ValueError(f"Server error {response.status_code}")
                 
+                response.raise_for_status()
                 data = response.json()
                 
-                # Проверяем, есть ли ответ в JSON
                 if 'choices' in data and len(data['choices']) > 0:
                     return data['choices'][0]['message']['content']
                 else:
-                    logging.error(f"Empty response from {model}: {data}")
-                    raise ValueError("Empty response")
+                    raise ValueError(f"Empty/Invalid JSON: {data}")
 
             except Exception as e:
-                logging.error(f"Agent {model} failed: {e}")
-                # Если модель не сработала, пробуем Fallback (резервную модель)
-                # ВАЖНО: проверяем, чтобы не зациклить рекурсию
-                if model != "deepseek/deepseek-chat": 
-                    logging.info("Switching to fallback model: deepseek/deepseek-chat")
-                    # Заменил deepseek-v3 на deepseek-chat (стандартное имя в OpenRouter)
-                    return await self._call("deepseek/deepseek-chat", messages)
+                logging.error(f"Failed {model}: {e}")
                 
-                return f"Ошибка генерации ({model}): {str(e)}"
+                # Логика Fallback: берем следующую модель из списка
+                next_attempt = attempt + 1
+                if next_attempt < len(self.fallback_chain):
+                    next_model = self.fallback_chain[next_attempt]
+                    logging.warning(f"⚠️ Switching to fallback ({next_model})...")
+                    # Небольшая пауза перед повтором, чтобы не спамить
+                    await asyncio.sleep(1) 
+                    return await self._call(next_model, messages, next_attempt)
+                
+                # Если все модели перебрали и ничего не помогло
+                return "❌ Извините, все AI-сервисы сейчас перегружены. Попробуйте через минуту."
 
 class Planner(BaseAgent):
     async def process(self, task: str, history: list) -> str:
-        # Убедимся, что история - это список словарей
-        valid_history = [m for m in history if isinstance(m, dict) and 'role' in m and 'content' in m]
-        messages = valid_history + [{"role": "user", "content": f"Задача: {task}"}]
-        # Используем надежную бесплатную модель
-        return await self._call("google/gemini-2.0-flash-exp:free", messages)
+        # Фильтруем историю от мусора
+        valid_history = [m for m in history if isinstance(m, dict) and m.get('content')]
+        
+        # Системный промпт для лучшего качества
+        system_msg = {"role": "system", "content": "Ты полезный ассистент. Отвечай кратко, по делу и структурировано."}
+        
+        messages = [system_msg] + valid_history + [{"role": "user", "content": task}]
+        
+        # Начинаем с первой модели в цепочке (Llama 3.1)
+        return await self._call(self.fallback_chain[0], messages)
 
 class Verifier(BaseAgent):
     async def process(self, text: str) -> str:
-        messages = [{"role": "user", "content": f"Проверь текст на ошибки: {text}"}]
-        return await self._call("google/gemini-2.0-flash-exp:free", messages)
+        messages = [
+            {"role": "system", "content": "Ты редактор. Найди ошибки и предложи улучшения. Если ошибок нет, напиши 'Ошибок нет'."},
+            {"role": "user", "content": f"Текст для проверки:\n{text}"}
+        ]
+        return await self._call(self.fallback_chain[0], messages)
