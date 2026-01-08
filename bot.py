@@ -73,22 +73,29 @@ async def cmd_plan(message: types.Message):
     await save_message(message.from_user.id, "assistant", plan)
 
 @dp.message(Command("new_skill"), AdminFilter())
-async def cmd_new_skill(message: types.Message):
+async def handle_new_skill(m: types.Message):
     try:
-        parts = message.text.split(maxsplit=2)
+        parts = m.text.split(maxsplit=2)
         if len(parts) < 3:
-            return await message.answer("Формат: /new_skill имя_файла код_навыка")
+            return await m.answer("Формат: /new_skill file_name code")
         
-        name, code = parts[1], parts[2]
-        os.makedirs("skills", exist_ok=True)
+        # Определяем name ЗДЕСЬ
+        filename = parts[1]
+        code = parts[2]
         
-        with open(f"skills/{name}.py", "w", encoding="utf-8") as f:
-            f.write(f'from aiogram import Router, types\nfrom aiogram.filters import Command\n\nrouter = Router()\n\n@router.message(Command("{name}"))\nasync def cmd_{name}(message: types.Message):\n    await message.answer("Навык {name} активирован!")\n\ndef setup():\n    return router\n')
-            f.write("\n" + code)
+        # Проверка на расширение
+        if not filename.endswith(".py"): 
+            filename += ".py"
+            
+        filepath = os.path.join("skills", filename)
         
-        await message.answer(f"✅ Навык `{name}` создан. Используйте /reload")
+        with open(filepath, "w", encoding="utf-8") as f: 
+            f.write(code)
+            
+        await m.answer(f"✅ Навык `{filename}` записан. Используйте /reload")
     except Exception as e:
-        await message.answer(f"❌ Ошибка создания: {e}")
+        await m.answer(f"❌ Ошибка записи: {e}")
+
 
 @dp.message(Command("reload"), AdminFilter())
 async def cmd_reload(message: types.Message):
