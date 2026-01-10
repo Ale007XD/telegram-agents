@@ -6,7 +6,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-# Импортируем агента и работу с БД для сохранения контекста
+# Импортируем агента и работу с БД
 from agents.base import Planner
 from database import save_message, get_user_context
 
@@ -21,8 +21,7 @@ router = Router()
 # Используем существующий ключ API
 agent = Planner(os.getenv("OPENROUTER_API_KEY"))
 
-# --- ТЕМАТИЧЕСКИЙ ПЛАН (Только заголовки!) ---
-# Мы больше не пишем текст уроков руками.
+# --- ТЕМАТИЧЕСКИЙ ПЛАН ---
 TOPICS = {
     "intro": [
         "История и суть карт Таро (Райдер-Уайт)",
@@ -54,7 +53,7 @@ TOPICS = {
 # --- СОСТОЯНИЯ ---
 class TaroStates(StatesGroup):
     menu = State()
-    lesson_active = State() # Состояние, когда урок открыт и можно задавать вопросы
+    lesson_active = State()
 
 # --- КЛАВИАТУРЫ ---
 def get_main_menu():
@@ -72,12 +71,10 @@ def get_main_menu():
 
 def get_nav_keyboard(section_key, idx, total):
     builder = InlineKeyboardBuilder()
-    # Навигация
     if idx > 0: builder.button(text="⬅️ Назад", callback_data=f"nav_{section_key}_{idx-1}")
     if idx < total - 1: builder.button(text="Вперед ➡️", callback_data=f"nav_{section_key}_{idx+1}")
     
-    # Кнопка вопроса (визуальная, вопросы пишутся текстом)
-    builder.button(text="❓ Задать вопрос учителю", callback_data="ask_hint")
+    builder.button(text="❓ Задать вопрос", callback_data="ask_hint")
     builder.button(text="🔝 Меню", callback_data="taro_menu")
     
     if idx > 0 and idx < total - 1: builder.adjust(2, 1, 1)
@@ -86,23 +83,21 @@ def get_nav_keyboard(section_key, idx, total):
 
 # --- ЛОГИКА ГЕНЕРАЦИИ ---
 async def generate_lesson_content(user_id: int, topic: str):
-    """Генерирует урок через LLM и сохраняет его в контекст истории"""
-    
+    # Промпт настроен так, чтобы минимизировать ошибки разметки
     prompt = (
-        f"Ты опытный учитель Таро. Твоя задача — провести мини-лекцию по теме: '{topic}'.\n"
-        f"1. Объясни суть кратко и понятно (используй Markdown, жирный шрифт, списки).\n"
-        f"2. Дай конкретный пример или метафору.\n"
-        f"3. Дай маленькое практическое задание.\n"
-        f"Не пиши длинное вступление, переходи сразу к делу. Объем: до 300 слов."
+        f"Ты учитель Таро. Тема урока: '{topic}'.\n"
+        f"1. Объясни суть кратко (до 250 слов).\n"
+        f"2. Приведи пример.\n"
+        f"3. Используй ТОЛЬКО безопасный Markdown: жирный шрифт (**текст**) и списки (- пункт).\n"
+        f"4. НЕ используй символы '_', '`', '[', ']' чтобы не ломать парсинг Telegram."
     )
     
-    # Генерируем
-    content = await agent.process(prompt, []) # Пустая история, чтобы урок был чистым
-    
-    # ВАЖНО: Сохраняем сгенерированный урок в базу как сообщение от ассистента.
-    # Это позволяет пользователю задать вопрос "Что это значит?" и LLM поймет контекст.
+    try:
+        content = await agent.process(prompt, [])
+    except Exception as e:
+        content = f"Ошибка генерации: {e}"
+        
     await save_message(user_id, "assistant", f"Урок '{topic}':\n{content}")
-    
     return content
 
 # --- ХЕНДЛЕРЫ ---
@@ -128,7 +123,6 @@ async def back_to_menu(callback: types.CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("topic_"))
 async def open_section(callback: types.CallbackQuery, state: FSMContext):
     section_key = callback.data.split("_")[1]
-    # Запускаем первый урок секции
     await run_lesson(callback, section_key, 0, state)
 
 @router.callback_query(F.data.startswith("nav_"))
@@ -149,61 +143,55 @@ async def run_lesson(callback: types.CallbackQuery, section_key: str, idx: int, 
     
     # 1. Показываем статус "Печатает..."
     await callback.message.edit_text(
-        f"⏳ <b>Генерирую урок:</b> {current_topic}...\nЭто может занять 5-10 секунд.",
+        f"⏳ <b>Генерирую урок:</b> {current_topic}...\nПодождите пару секунд.",
         parse_mode="HTML"
     )
     
-    # 2. Генерируем контент через LLM
+    # 2. Генерируем контент
+    content = await generate_lesson_content(callback.from_user.id, current_topic)
+    
+    # 3. Отправляем (С ЗАЩИТОЙ ОТ ОШИБОК РАЗМЕТКИ)
     try:
-        content = await generate_lesson_content(callback.from_user.id, current_topic)
-        
-        # 3. Обновляем сообщение
+        # Попытка 1: Красивый Markdown
         await callback.message.edit_text(
-            f"🎓 <b>Тема: {current_topic}</b> ({idx+1}/{len(topics_list)})\n\n{content}",
+            f"🎓 *Тема: {current_topic}* ({idx+1}/{len(topics_list)})\n\n{content}",
             reply_markup=get_nav_keyboard(section_key, idx, len(topics_list)),
-            parse_mode="Markdown" # LLM обычно отдает Markdown
+            parse_mode="Markdown"
         )
-        
-        # 4. Устанавливаем состояние "Активный урок"
-        await state.set_state(TaroStates.lesson_active)
-        # Запоминаем текущую тему в стейте (опционально)
-        await state.update_data(current_topic=current_topic)
-        
-    except Exception as e:
-        await callback.message.edit_text(f"❌ Ошибка генерации: {e}", reply_markup=get_main_menu())
-
-# --- ОБРАБОТКА ВОПРОСОВ (КОНТЕКСТ) ---
+    except Exception:
+        # Попытка 2: Если Markdown сломан, отправляем чистый текст (без parse_mode)
+        # Убираем возможные теги из заголовка для чистоты
+        clean_text = f"🎓 Тема: {current_topic} ({idx+1}/{len(topics_list)})\n\n{content}"
+        await callback.message.edit_text(
+            clean_text,
+            reply_markup=get_nav_keyboard(section_key, idx, len(topics_list)),
+            parse_mode=None # Безопасный режим
+        )
+    
+    await state.set_state(TaroStates.lesson_active)
 
 @router.callback_query(F.data == "ask_hint")
 async def ask_hint_callback(callback: types.CallbackQuery):
-    await callback.answer("Просто напишите ваш вопрос в чат, и я отвечу по теме урока!", show_alert=True)
+    await callback.answer("Напишите ваш вопрос в чат!", show_alert=True)
 
-# Этот хендлер ловит текст ТОЛЬКО когда открыт урок
 @router.message(TaroStates.lesson_active)
-async def handle_student_question(message: types.Message, state: FSMContext):
+async def handle_student_question(message: types.Message):
     user_id = message.from_user.id
+    history = await get_user_context(user_id, limit=6)
     
-    # Получаем историю (в ней уже есть только что сгенерированный урок!)
-    history = await get_user_context(user_id, limit=6) # Берем последние сообщения
+    wait = await message.answer("🤔 ...")
     
-    waiting_msg = await message.answer("🤔 Думаю над ответом...")
-    
-    # Формируем промпт для ответа на вопрос
-    # Planner сам подтянет историю, но мы можем уточнить роль
-    system_instruction = "Ты учитель Таро. Ученик задал вопрос по текущему уроку. Ответь кратко и помоги разобраться."
-    
-    # Добавляем системную инструкцию в историю виртуально (или через Planner.process логику)
-    # В agents/base.py Planner уже добавляет историю.
-    
-    answer = await agent.process(message.text, history)
-    
-    await waiting_msg.delete()
-    await message.answer(f"💁‍♂️ **Ответ:**\n{answer}", parse_mode="Markdown")
-    
-    # Ответ ассистента автоматически сохранится в БД через middleware в bot.py? 
-    # НЕТ, в bot.py middleware сохраняет только USER messages (обычно) или если настроено иначе.
-    # Поэтому сохраняем ответ бота явно:
-    await save_message(user_id, "assistant", answer)
+    try:
+        answer = await agent.process(message.text, history)
+        # Тоже защищаем от ошибок разметки
+        try:
+            await wait.edit_text(f"💁‍♂️ **Ответ:**\n{answer}", parse_mode="Markdown")
+        except:
+            await wait.edit_text(f"💁‍♂️ Ответ:\n{answer}", parse_mode=None)
+            
+        await save_message(user_id, "assistant", answer)
+    except Exception as e:
+        await wait.edit_text(f"Ошибка: {e}")
 
 def setup():
     return router
